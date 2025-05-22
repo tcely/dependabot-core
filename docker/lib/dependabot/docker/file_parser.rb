@@ -12,14 +12,17 @@ module Dependabot
       YAML_REGEXP = /^[^\.].*\.ya?ml$/i
       ARG = /ARG/i
       FROM = /FROM/i
-      ARG_WITH_DEFAULT_VALUE = /(?<variable>\w+)\=(?<quote_open>["'])?(?<value>\S+)(?<quote_closed>["'])?/
       PLATFORM = /--platform\=(?<platform>\S+)/
       TAG_NO_PREFIX = /(?<tag>[\w][\w.-]{0,127})/
       TAG = /:#{TAG_NO_PREFIX}/
       DIGEST = /(?<digest>[0-9a-f]{64})/
-      VARIABLE = /\$\{?(?<variable>\w+)\}?/
+      VARIABLE = /(?<variable>\w+)/
 
       ARG_LINE = /^#{ARG}\s+/x
+      USED_VARIABLE = /\$\{?#{VARIABLE}\}?/x
+      ARG_WITH_DEFAULT_VALUE = 
+        %r{#{VARIABLE}\=(?<quote_open>["'])?
+          (?<value>\S+)(?<quote_closed>["'])?}x
       FROM_LINE =
         %r{^#{FROM}\s+(#{PLATFORM}\s+)?(#{REGISTRY}/)?
           #{IMAGE}#{TAG}?(?:@sha256:#{DIGEST})?#{NAME}?}x
@@ -63,7 +66,7 @@ module Dependabot
             seen_line["from"] = true
 
             try_line = line
-            try_line = line.gsub(VARIABLE, arg_hash) if VARIABLE.match?(line)
+            try_line = line.gsub(USED_VARIABLE, arg_hash) if USED_VARIABLE.match?(line)
             parsed_from_line = T.must(FROM_LINE.match(try_line)).named_captures
             parsed_from_line["registry"] = nil if parsed_from_line["registry"] == "docker.io"
 
