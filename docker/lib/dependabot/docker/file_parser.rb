@@ -19,7 +19,7 @@ module Dependabot
       DIGEST = /(?<digest>[0-9a-f]{64})/
       VARIABLE = /\$\{?(?<variable>\w+)\}?/
 
-      ARG_LINE = %r{^#{ARG}\s+}x
+      ARG_LINE = /^#{ARG}\s+/x
       FROM_LINE =
         %r{^#{FROM}\s+(#{PLATFORM}\s+)?(#{REGISTRY}/)?
           #{IMAGE}#{TAG}?(?:@sha256:#{DIGEST})?#{NAME}?}x
@@ -43,26 +43,24 @@ module Dependabot
         dependency_set = DependencySet.new
 
         dockerfiles.each do |dockerfile|
-          arg_hash = {}
-          last_line = ""
+          arg_hash = Hash.new( "" )
+          seen_line = Hash.new( false )
           T.must(dockerfile.content).each_line do |line|
-            variables = nil
-            last_line = "ARG" if "" == last_line && ARG_LINE.match?(line)
-            variables = line.split(/\s+/).map(&:strip) if "ARG" == last_line
-            next unless variables or FROM_LINE.match?(line)
-
-            variables = [] if FROM_LINE.match?(line)
-            variables.flat_map do |variable|
-              next if ARG.match?(variable)
-              next unless ARG_WITH_DEFAULT_VALUE.match?(variable)
-              parsed_from_variable = T.must(ARG_WITH_DEFAULT_VALUE.match(variable)).named_captures
-              next unless parsed_from_variable["quote_open"] == parsed_from_variable["quote_closed"]
-              arg_hash["$" + parsed_from_variable["variable"]] = parsed_from_variable["value"]
-              arg_hash["${" + parsed_from_variable["variable"] + "}"] = parsed_from_variable["value"]
+            seen_line["arg"] = true if ARG_LINE.match?(line)
+            if seen_line["arg"] && !seen_line["from"]
+              variables = line.split(/\s+/).map(&:strip)
+              variables.flat_map do |variable|
+                next if ARG.match?(variable)
+                next unless ARG_WITH_DEFAULT_VALUE.match?(variable)
+                parsed_from_variable = T.must(ARG_WITH_DEFAULT_VALUE.match(variable)).named_captures
+                next unless parsed_from_variable["quote_open"] == parsed_from_variable["quote_closed"]
+                arg_hash["$" + parsed_from_variable["variable"]] = parsed_from_variable["value"]
+                arg_hash["${" + parsed_from_variable["variable"] + "}"] = parsed_from_variable["value"]
+              end
             end
 
             next unless FROM_LINE.match?(line)
-            last_line = "FROM"
+            seen_line["from"] = true
 
             try_line = line
             try_line = line.gsub(VARIABLE, arg_hash) if VARIABLE.match?(line)
