@@ -1,3 +1,4 @@
+# typed: true
 # frozen_string_literal: true
 
 require "excon"
@@ -6,6 +7,7 @@ require "dependabot/bundler/helpers"
 require "dependabot/bundler/update_checker"
 require "dependabot/bundler/file_updater/lockfile_updater"
 require "dependabot/bundler/requirement"
+require "dependabot/registry_client"
 require "dependabot/shared_helpers"
 require "dependabot/errors"
 
@@ -24,6 +26,7 @@ module Dependabot
                        replacement_git_pin: nil, remove_git_source: false,
                        unlock_requirement: true,
                        latest_allowable_version: nil,
+                       cooldown_options: nil,
                        options:)
           @dependency                  = dependency
           @unprepared_dependency_files = unprepared_dependency_files
@@ -35,7 +38,10 @@ module Dependabot
           @remove_git_source           = remove_git_source
           @unlock_requirement          = unlock_requirement
           @latest_allowable_version    = latest_allowable_version
+          @cooldown_options            = cooldown_options
           @options                     = options
+
+          @latest_allowable_version_incompatible_with_ruby = false
         end
 
         def latest_resolvable_version_details
@@ -43,12 +49,20 @@ module Dependabot
             fetch_latest_resolvable_version_details
         end
 
+        def latest_allowable_version_incompatible_with_ruby?
+          @latest_allowable_version_incompatible_with_ruby
+        end
+
         private
 
-        attr_reader :dependency, :unprepared_dependency_files,
-                    :repo_contents_path, :credentials, :ignored_versions,
-                    :replacement_git_pin, :latest_allowable_version,
-                    :options
+        attr_reader :dependency
+        attr_reader :unprepared_dependency_files
+        attr_reader :repo_contents_path
+        attr_reader :credentials
+        attr_reader :ignored_versions
+        attr_reader :replacement_git_pin
+        attr_reader :latest_allowable_version
+        attr_reader :options
 
         def remove_git_source?
           @remove_git_source
@@ -104,7 +118,7 @@ module Dependabot
                 # mismatch
                 return nil if ruby_version_incompatible?(details)
 
-                details[:version] = Gem::Version.new(details[:version])
+                details[:version] = Dependabot::Bundler::Version.new(details[:version])
               end
               details
             end
@@ -139,10 +153,18 @@ module Dependabot
         end
 
         def ruby_lock_error?(error)
-          return false unless error.message.include?(" for gem \"ruby\0\"")
+          return false unless conflict_on_ruby?(error)
           return false if @gemspec_ruby_unlocked
 
           dependency_files.any? { |f| f.name.end_with?(".gemspec") }
+        end
+
+        def conflict_on_ruby?(error)
+          if bundler_version == "1"
+            error.message.include?(" for gem \"ruby\0\"")
+          else
+            error.message.include?(" depends on Ruby ") && error.message.include?(" current Ruby version is ")
+          end
         end
 
         def regenerate_dependency_files_without_ruby_lock
@@ -163,11 +185,11 @@ module Dependabot
             LatestVersionFinder.new(
               dependency: dependency,
               dependency_files: dependency_files,
-              repo_contents_path: repo_contents_path,
               credentials: credentials,
               ignored_versions: ignored_versions,
               raise_on_ignored: @raise_on_ignored,
               security_advisories: [],
+              cooldown_options: @cooldown_options,
               options: options
             ).latest_version_details
         end
@@ -179,10 +201,9 @@ module Dependabot
           # If no Ruby version is specified, we don't have a problem
           return false unless details[:ruby_version]
 
-          versions = Excon.get(
-            "https://rubygems.org/api/v1/versions/#{dependency.name}.json",
-            idempotent: true,
-            **SharedHelpers.excon_defaults
+          versions = Dependabot::RegistryClient.get(
+            url: "https://rubygems.org/api/v1/versions/#{dependency.name}.json",
+            headers: { "Accept-Encoding" => "gzip" }
           )
 
           # Give the benefit of the doubt if something goes wrong fetching
@@ -190,9 +211,9 @@ module Dependabot
           return false unless versions.status == 200
 
           ruby_requirement =
-            JSON.parse(versions.body).
-            find { |version| version["number"] == details[:version] }&.
-            fetch("ruby_version", nil)
+            JSON.parse(versions.body)
+                .find { |version| version["number"] == details[:version] }
+                &.fetch("ruby_version", nil)
 
           # Give the benefit of the doubt if we can't find the version's
           # required Ruby version.
@@ -201,7 +222,9 @@ module Dependabot
           ruby_requirement = Dependabot::Bundler::Requirement.new(ruby_requirement)
           current_ruby_version = Dependabot::Bundler::Version.new(details[:ruby_version])
 
-          !ruby_requirement.satisfied_by?(current_ruby_version)
+          return false if ruby_requirement.satisfied_by?(current_ruby_version)
+
+          @latest_allowable_version_incompatible_with_ruby = true
         rescue JSON::ParserError, Excon::Error::Socket, Excon::Error::Timeout
           # Give the benefit of the doubt if something goes wrong fetching
           # version details (could be that it's a private index, etc.)

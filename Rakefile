@@ -5,12 +5,13 @@ require "English"
 require "net/http"
 require "uri"
 require "json"
-require "shellwords"
 require "rubygems/package"
 require "bundler"
-require "./common/lib/dependabot/version"
+require "./common/lib/dependabot"
 require "yaml"
 
+# ./dependabot-core.gemspec is purposefully excluded from this list
+# because it's an empty gem as a placeholder to prevent namesquatting.
 GEMSPECS = %w(
   common/dependabot-common.gemspec
   go_modules/dependabot-go_modules.gemspec
@@ -30,6 +31,14 @@ GEMSPECS = %w(
   python/dependabot-python.gemspec
   pub/dependabot-pub.gemspec
   omnibus/dependabot-omnibus.gemspec
+  silent/dependabot-silent.gemspec
+  swift/dependabot-swift.gemspec
+  devcontainers/dependabot-devcontainers.gemspec
+  dotnet_sdk/dependabot-dotnet_sdk.gemspec
+  bun/dependabot-bun.gemspec
+  docker_compose/dependabot-docker_compose.gemspec
+  uv/dependabot-uv.gemspec
+  helm/dependabot-helm.gemspec
 ).freeze
 
 def run_command(command)
@@ -59,7 +68,9 @@ namespace :gems do
 
     GEMSPECS.each do |gemspec_path|
       gem_name = File.basename(gemspec_path).sub(/\.gemspec$/, "")
-      gem_path = "pkg/#{gem_name}-#{Dependabot::VERSION}.gem"
+      gem_name_and_version = "#{gem_name}-#{Dependabot::VERSION}"
+      gem_path = "pkg/#{gem_name_and_version}.gem"
+      gem_attestation_path = "pkg/#{gem_name_and_version}.sigstore.json"
 
       attempts = 0
       loop do
@@ -69,13 +80,15 @@ namespace :gems do
         else
           puts "> Releasing #{gem_path}"
           attempts += 1
-          sleep(2)
           begin
-            sh "gem push #{gem_path}"
+            sh "gem exec sigstore-cli:0.2.1 sign #{gem_path} --bundle #{gem_attestation_path}"
+            sh "gem push #{gem_path} --attestation #{gem_attestation_path}"
             break
           rescue StandardError => e
             puts "! `gem push` failed with error: #{e}"
             raise if attempts >= 3
+
+            sleep(2)
           end
         end
       end
@@ -83,7 +96,7 @@ namespace :gems do
   end
 
   task :clean do
-    FileUtils.rm(Dir["pkg/*.gem"])
+    FileUtils.rm(Dir["pkg/*.gem", "pkg/*.sigstore.json"])
   end
 end
 
@@ -100,8 +113,8 @@ end
 namespace :rubocop do
   task :sort do
     File.write(
-      ".rubocop.yml",
-      YAML.load_file(".rubocop.yml").sort_by_key(true).to_yaml
+      "omnibus/.rubocop.yml",
+      YAML.load_file("omnibus/.rubocop.yml").sort_by_key(true).to_yaml
     )
   end
 end
@@ -119,55 +132,8 @@ def guard_tag_match
 end
 
 def rubygems_release_exists?(name, version)
-  uri = URI.parse("https://rubygems.org/api/v1/versions/#{name}.json")
+  uri = URI.parse("https://rubygems.org/api/v2/rubygems/#{name}/versions/#{version}.json")
   response = Net::HTTP.get_response(uri)
-  abort "Gem #{name} doesn't exist on rubygems" if response.code != "200"
-
-  body = JSON.parse(response.body)
-  existing_versions = body.map { |b| b["number"] }
-  existing_versions.include?(version)
-end
-
-def changed_packages
-  all_packages = GEMSPECS.
-                 select { |gs| gs.include?("/") }.
-                 map { |gs| "./" + gs.split("/").first }
-
-  compare_url = ENV["CIRCLE_COMPARE_URL"]
-  if compare_url.nil?
-    warn "CIRCLE_COMPARE_URL not set, so changed packages can't be calculated"
-    return all_packages
-  end
-  puts "CIRCLE_COMPARE_URL: #{compare_url}"
-
-  range = compare_url.split("/").last
-  puts "Detected commit range '#{range}' from CIRCLE_COMPARE_URL"
-  unless range&.include?("..")
-    warn "Invalid commit range, so changed packages can't be calculated"
-    return all_packages
-  end
-
-  core_paths = %w(Dockerfile Dockerfile.ci common/lib common/bin
-                  common/dependabot-common.gemspec)
-  core_changed = commit_range_changes_paths?(range, core_paths)
-
-  packages = all_packages.select do |package|
-    next true if core_changed
-
-    if commit_range_changes_paths?(range, [package])
-      puts "Commit range changes #{package}"
-      true
-    else
-      puts "Commit range doesn't change #{package}"
-      false
-    end
-  end
-
-  packages
-end
-
-def commit_range_changes_paths?(range, paths)
-  cmd = %w(git diff --quiet) + [range, "--"] + paths
-  !system(Shellwords.join(cmd))
+  response.code == "200"
 end
 # rubocop:enable Metrics/BlockLength
